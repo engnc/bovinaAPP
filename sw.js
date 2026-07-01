@@ -1,4 +1,4 @@
-const CACHE = "is-defteri-v1";
+const CACHE = "is-defteri-v2";
 const SHELL = ["./index.html", "./style.css", "./app.js", "./config.js", "./manifest.json"];
 
 self.addEventListener("install", (e) => {
@@ -13,11 +13,19 @@ self.addEventListener("activate", (e) => {
   self.clients.claim();
 });
 
-// Sadece kendi statik dosyalarımız için cache-first; Supabase istekleri her zaman ağdan gider.
+// Network-first: önce internetten en güncel dosyayı çekmeye çalışır,
+// bağlantı yoksa önbellekteki son bilinen sürümü gösterir.
+// Bu sayede app.js/style.css güncellendiğinde telefonda eski sürüm takılı kalmaz.
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   if (url.origin !== location.origin) return;
   e.respondWith(
-    caches.match(e.request).then((cached) => cached || fetch(e.request))
+    fetch(e.request)
+      .then((res) => {
+        const resClone = res.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, resClone));
+        return res;
+      })
+      .catch(() => caches.match(e.request))
   );
 });
