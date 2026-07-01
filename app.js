@@ -240,6 +240,34 @@ function escapeHtml(str) {
 // ---------- ay filtresi değişince ----------
 $("#expenseMonthFilter").addEventListener("change", renderExpenses);
 
+// ---------- Excel'e aktar ----------
+function exportExpensesToExcel() {
+  const filterMonth = $("#expenseMonthFilter").value;
+  const filtered = (filterMonth === "all" ? state.expenses : state.expenses.filter((e) => e.date?.slice(0, 7) === filterMonth))
+    .slice()
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+
+  if (!filtered.length) return toast("Aktarılacak kayıt yok");
+
+  const rows = filtered.map((e) => ({
+    "Tarih": fmtDate(e.date),
+    "Kim": e.person || "",
+    "Açıklama": e.description || "",
+    "Tutar (₺)": Number(e.amount || 0),
+  }));
+  const total = filtered.reduce((s, e) => s + Number(e.amount || 0), 0);
+  rows.push({ "Tarih": "", "Kim": "", "Açıklama": "TOPLAM", "Tutar (₺)": total });
+
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws["!cols"] = [{ wch: 12 }, { wch: 16 }, { wch: 34 }, { wch: 12 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Harcamalar");
+
+  const label = filterMonth === "all" ? "tum-zamanlar" : filterMonth;
+  XLSX.writeFile(wb, `harcamalar-${label}.xlsx`);
+}
+$("#exportExcelBtn").addEventListener("click", exportExpensesToExcel);
+
 // ---------- todo filtre chip'leri ----------
 $all(".chip").forEach((c) => c.addEventListener("click", () => {
   $all(".chip").forEach((x) => x.classList.remove("active"));
@@ -248,7 +276,7 @@ $all(".chip").forEach((c) => c.addEventListener("click", () => {
   renderTodos();
 }));
 
-// ---------- kart tıklamaları (silme, foto büyütme, todo toggle) ----------
+// ---------- kart tıklamaları (silme, foto büyütme, todo toggle, düzenleme) ----------
 document.addEventListener("click", async (e) => {
   const delBtn = e.target.closest("[data-del]");
   if (delBtn) {
@@ -271,8 +299,20 @@ document.addEventListener("click", async (e) => {
   if (photoImg) {
     $("#photoOverlayImg").src = photoImg.dataset.photo;
     $("#photoOverlay").classList.remove("hidden");
+    return;
+  }
+  const card = e.target.closest(".entry-card");
+  if (card) {
+    openEditFor(card.dataset.table, card.dataset.id);
   }
 });
+
+function openEditFor(table, id) {
+  if (table === "expenses") return openExpenseForm(state.expenses.find((x) => x.id === id));
+  if (table === "quotes") return openQuoteForm(state.quotes.find((x) => x.id === id));
+  if (table === "notes") return openNoteForm(state.notes.find((x) => x.id === id));
+  if (table === "todos") return openTodoForm(state.todos.find((x) => x.id === id));
+}
 $("#photoOverlayClose").addEventListener("click", () => $("#photoOverlay").classList.add("hidden"));
 $("#photoOverlay").addEventListener("click", (e) => { if (e.target.id === "photoOverlay") $("#photoOverlay").classList.add("hidden"); });
 
@@ -306,23 +346,54 @@ function photoPickerHtml(fieldId) {
   `;
 }
 
-function wirePhotoPicker(fieldId) {
+function previewBlock(url, fieldId) {
+  return `
+    <div class="photo-preview-wrap">
+      <img class="photo-preview" src="${url}">
+      <button type="button" class="photo-remove" id="${fieldId}_remove">✕</button>
+    </div>`;
+}
+
+function renderPhotoPreview(fieldId) {
+  const wrap = $(`#${fieldId}_previewWrap`);
+  if (state.pendingPhotoFile) {
+    wrap.innerHTML = previewBlock(URL.createObjectURL(state.pendingPhotoFile), fieldId);
+  } else if (state.existingPhotoUrl && !state.photoRemoved) {
+    wrap.innerHTML = previewBlock(state.existingPhotoUrl, fieldId);
+  } else {
+    wrap.innerHTML = "";
+  }
+  const removeBtn = $(`#${fieldId}_remove`);
+  if (removeBtn) {
+    removeBtn.addEventListener("click", () => {
+      state.pendingPhotoFile = null;
+      state.photoRemoved = true;
+      renderPhotoPreview(fieldId);
+    });
+  }
+}
+
+// existingUrl: düzenleme modunda mevcut fotoğrafın URL'i (yoksa null)
+function wirePhotoPicker(fieldId, existingUrl) {
+  state.pendingPhotoFile = null;
+  state.existingPhotoUrl = existingUrl || null;
+  state.photoRemoved = false;
+  renderPhotoPreview(fieldId);
   const handle = (file) => {
     if (!file) return;
     state.pendingPhotoFile = file;
-    const url = URL.createObjectURL(file);
-    $(`#${fieldId}_previewWrap`).innerHTML = `
-      <div class="photo-preview-wrap">
-        <img class="photo-preview" src="${url}">
-        <button type="button" class="photo-remove" id="${fieldId}_remove">✕</button>
-      </div>`;
-    $(`#${fieldId}_remove`).addEventListener("click", () => {
-      state.pendingPhotoFile = null;
-      $(`#${fieldId}_previewWrap`).innerHTML = "";
-    });
+    state.photoRemoved = false;
+    renderPhotoPreview(fieldId);
   };
   $(`#${fieldId}_camera`).addEventListener("change", (e) => handle(e.target.files[0]));
   $(`#${fieldId}_gallery`).addEventListener("change", (e) => handle(e.target.files[0]));
+}
+
+// Formun kaydedilecek fotoğraf URL'ini belirler: yeni seçilmiş / kaldırılmış / değişmemiş
+async function resolvePhotoUrl() {
+  if (state.pendingPhotoFile) return await uploadPhoto(state.pendingPhotoFile);
+  if (state.photoRemoved) return null;
+  return state.existingPhotoUrl || null;
 }
 
 // ============================================
@@ -353,72 +424,83 @@ $("#fab").addEventListener("click", () => {
 // ---- Harcama formu ----
 const recentPeople = () => [...new Set(state.expenses.map((e) => e.person).filter(Boolean))].slice(0, 6);
 
-function openExpenseForm() {
+function openExpenseForm(existing) {
   const people = recentPeople();
-  openModal("Yeni Harcama", `
+  const isEdit = !!existing;
+  openModal(isEdit ? "Harcamayı Düzenle" : "Yeni Harcama", `
     <div class="field-row">
-      <div class="field"><label>Tarih</label><input type="date" id="f_date" value="${todayISO()}"></div>
-      <div class="field"><label>Tutar (₺)</label><input type="number" id="f_amount" inputmode="decimal" placeholder="0"></div>
+      <div class="field"><label>Tarih</label><input type="date" id="f_date" value="${isEdit ? existing.date : todayISO()}"></div>
+      <div class="field"><label>Tutar (₺)</label><input type="number" id="f_amount" inputmode="decimal" placeholder="0" value="${isEdit ? existing.amount : ""}"></div>
     </div>
     <div class="field">
       <label>Kim harcadı</label>
-      <input type="text" id="f_person" list="peopleList" placeholder="İsim yaz">
+      <input type="text" id="f_person" list="peopleList" placeholder="İsim yaz" value="${isEdit ? escapeHtml(existing.person || "") : ""}">
       <datalist id="peopleList">${people.map((p) => `<option value="${escapeHtml(p)}">`).join("")}</datalist>
     </div>
-    <div class="field"><label>Ne için</label><textarea id="f_desc" placeholder="Örn: mutfak malzemesi, tamirat..."></textarea></div>
+    <div class="field"><label>Ne için</label><textarea id="f_desc" placeholder="Örn: mutfak malzemesi, tamirat...">${isEdit ? escapeHtml(existing.description || "") : ""}</textarea></div>
     <button class="btn-primary" id="f_submit">Kaydet</button>
+    ${isEdit ? `<button type="button" class="btn-danger-link" id="f_delete">Kaydı sil</button>` : ""}
   `, () => {
+    if (isEdit) $("#f_delete").addEventListener("click", () => deleteRecord("expenses", existing.id));
     $("#f_submit").addEventListener("click", async () => {
       const person = $("#f_person").value.trim();
       const amount = parseFloat($("#f_amount").value);
       if (!person || !amount) return toast("İsim ve tutar gerekli");
       setSubmitting(true);
-      const { error } = await sb.from("expenses").insert({
+      const payload = {
         date: $("#f_date").value || todayISO(),
         person,
         amount,
         description: $("#f_desc").value.trim(),
-      });
+      };
+      const { error } = isEdit
+        ? await sb.from("expenses").update(payload).eq("id", existing.id)
+        : await sb.from("expenses").insert(payload);
       setSubmitting(false);
       if (error) return toast("Kaydedilemedi: " + error.message);
       closeModal();
-      toast("Harcama eklendi");
+      toast(isEdit ? "Harcama güncellendi" : "Harcama eklendi");
     });
   });
 }
 
 // ---- Teklif formu ----
-function openQuoteForm() {
-  openModal("Yeni Teklif", `
+function openQuoteForm(existing) {
+  const isEdit = !!existing;
+  openModal(isEdit ? "Teklifi Düzenle" : "Yeni Teklif", `
     <div class="field-row">
-      <div class="field"><label>Tarih</label><input type="date" id="f_date" value="${todayISO()}"></div>
-      <div class="field"><label>Fiyat (₺)</label><input type="number" id="f_price" inputmode="decimal" placeholder="0"></div>
+      <div class="field"><label>Tarih</label><input type="date" id="f_date" value="${isEdit ? existing.date : todayISO()}"></div>
+      <div class="field"><label>Fiyat (₺)</label><input type="number" id="f_price" inputmode="decimal" placeholder="0" value="${isEdit && existing.price != null ? existing.price : ""}"></div>
     </div>
-    <div class="field"><label>Ürün</label><input type="text" id="f_product" placeholder="Örn: 40 kişilik masa"></div>
-    <div class="field"><label>Nereden alındı</label><input type="text" id="f_source" placeholder="Firma / kişi adı"></div>
-    <div class="field"><label>Not (opsiyonel)</label><textarea id="f_notes" placeholder="Detay, vade, teslimat vb."></textarea></div>
+    <div class="field"><label>Ürün</label><input type="text" id="f_product" placeholder="Örn: 40 kişilik masa" value="${isEdit ? escapeHtml(existing.product_name || "") : ""}"></div>
+    <div class="field"><label>Nereden alındı</label><input type="text" id="f_source" placeholder="Firma / kişi adı" value="${isEdit ? escapeHtml(existing.source || "") : ""}"></div>
+    <div class="field"><label>Not (opsiyonel)</label><textarea id="f_notes" placeholder="Detay, vade, teslimat vb.">${isEdit ? escapeHtml(existing.notes || "") : ""}</textarea></div>
     ${photoPickerHtml("qphoto")}
     <button class="btn-primary" id="f_submit">Kaydet</button>
+    ${isEdit ? `<button type="button" class="btn-danger-link" id="f_delete">Kaydı sil</button>` : ""}
   `, () => {
-    wirePhotoPicker("qphoto");
+    wirePhotoPicker("qphoto", isEdit ? existing.photo_url : null);
+    if (isEdit) $("#f_delete").addEventListener("click", () => deleteRecord("quotes", existing.id));
     $("#f_submit").addEventListener("click", async () => {
       const product = $("#f_product").value.trim();
       if (!product) return toast("Ürün adı gerekli");
       setSubmitting(true);
       try {
-        let photo_url = null;
-        if (state.pendingPhotoFile) photo_url = await uploadPhoto(state.pendingPhotoFile);
-        const { error } = await sb.from("quotes").insert({
+        const photo_url = await resolvePhotoUrl();
+        const payload = {
           date: $("#f_date").value || todayISO(),
           product_name: product,
           source: $("#f_source").value.trim(),
           price: $("#f_price").value ? parseFloat($("#f_price").value) : null,
           notes: $("#f_notes").value.trim(),
           photo_url,
-        });
+        };
+        const { error } = isEdit
+          ? await sb.from("quotes").update(payload).eq("id", existing.id)
+          : await sb.from("quotes").insert(payload);
         if (error) throw error;
         closeModal();
-        toast("Teklif eklendi");
+        toast(isEdit ? "Teklif güncellendi" : "Teklif eklendi");
       } catch (err) {
         toast("Kaydedilemedi: " + err.message);
       }
@@ -428,24 +510,29 @@ function openQuoteForm() {
 }
 
 // ---- Not formu ----
-function openNoteForm() {
-  openModal("Yeni Not", `
-    <div class="field"><label>Not</label><textarea id="f_content" placeholder="Ne not etmek istersin?"></textarea></div>
+function openNoteForm(existing) {
+  const isEdit = !!existing;
+  openModal(isEdit ? "Notu Düzenle" : "Yeni Not", `
+    <div class="field"><label>Not</label><textarea id="f_content" placeholder="Ne not etmek istersin?">${isEdit ? escapeHtml(existing.content || "") : ""}</textarea></div>
     ${photoPickerHtml("nphoto")}
     <button class="btn-primary" id="f_submit">Kaydet</button>
+    ${isEdit ? `<button type="button" class="btn-danger-link" id="f_delete">Kaydı sil</button>` : ""}
   `, () => {
-    wirePhotoPicker("nphoto");
+    wirePhotoPicker("nphoto", isEdit ? existing.photo_url : null);
+    if (isEdit) $("#f_delete").addEventListener("click", () => deleteRecord("notes", existing.id));
     $("#f_submit").addEventListener("click", async () => {
       const content = $("#f_content").value.trim();
       if (!content) return toast("Not boş olamaz");
       setSubmitting(true);
       try {
-        let photo_url = null;
-        if (state.pendingPhotoFile) photo_url = await uploadPhoto(state.pendingPhotoFile);
-        const { error } = await sb.from("notes").insert({ content, photo_url });
+        const photo_url = await resolvePhotoUrl();
+        const payload = { content, photo_url };
+        const { error } = isEdit
+          ? await sb.from("notes").update(payload).eq("id", existing.id)
+          : await sb.from("notes").insert(payload);
         if (error) throw error;
         closeModal();
-        toast("Not eklendi");
+        toast(isEdit ? "Not güncellendi" : "Not eklendi");
       } catch (err) {
         toast("Kaydedilemedi: " + err.message);
       }
@@ -455,30 +542,42 @@ function openNoteForm() {
 }
 
 // ---- Yapılacak formu ----
-function openTodoForm() {
-  openModal("Yeni Görev", `
-    <div class="field"><label>Görev</label><textarea id="f_content" placeholder="Ne yapılacak?"></textarea></div>
+function openTodoForm(existing) {
+  const isEdit = !!existing;
+  openModal(isEdit ? "Görevi Düzenle" : "Yeni Görev", `
+    <div class="field"><label>Görev</label><textarea id="f_content" placeholder="Ne yapılacak?">${isEdit ? escapeHtml(existing.content || "") : ""}</textarea></div>
     ${photoPickerHtml("tphoto")}
     <button class="btn-primary" id="f_submit">Kaydet</button>
+    ${isEdit ? `<button type="button" class="btn-danger-link" id="f_delete">Kaydı sil</button>` : ""}
   `, () => {
-    wirePhotoPicker("tphoto");
+    wirePhotoPicker("tphoto", isEdit ? existing.photo_url : null);
+    if (isEdit) $("#f_delete").addEventListener("click", () => deleteRecord("todos", existing.id));
     $("#f_submit").addEventListener("click", async () => {
       const content = $("#f_content").value.trim();
       if (!content) return toast("Görev boş olamaz");
       setSubmitting(true);
       try {
-        let photo_url = null;
-        if (state.pendingPhotoFile) photo_url = await uploadPhoto(state.pendingPhotoFile);
-        const { error } = await sb.from("todos").insert({ content, photo_url, done: false });
+        const photo_url = await resolvePhotoUrl();
+        const payload = isEdit ? { content, photo_url } : { content, photo_url, done: false };
+        const { error } = isEdit
+          ? await sb.from("todos").update(payload).eq("id", existing.id)
+          : await sb.from("todos").insert(payload);
         if (error) throw error;
         closeModal();
-        toast("Görev eklendi");
+        toast(isEdit ? "Görev güncellendi" : "Görev eklendi");
       } catch (err) {
         toast("Kaydedilemedi: " + err.message);
       }
       setSubmitting(false);
     });
   });
+}
+
+async function deleteRecord(table, id) {
+  if (!confirm("Bu kaydı silmek istediğine emin misin?")) return;
+  const { error } = await sb.from(table).delete().eq("id", id);
+  if (error) return toast("Silinemedi: " + error.message);
+  closeModal();
 }
 
 function setSubmitting(is) {
